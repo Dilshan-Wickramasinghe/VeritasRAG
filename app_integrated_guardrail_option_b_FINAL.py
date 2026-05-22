@@ -92,6 +92,13 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .warn-box { background:#2b1f0a; border:1px solid #e3b34166; border-radius:8px; padding:0.55rem 0.8rem; color:#e3b341; margin:3px 0; }
 .reason-box { background:#2d1117; border:1px solid #f8514966; border-radius:8px; padding:0.7rem 0.9rem; color:#f85149; margin-top:0.5rem; }
 .filter-item { background:#1f2937; border-left:3px solid #58a6ff; padding:4px 10px; border-radius:0 4px 4px 0; color:#79c0ff; font-family:'JetBrains Mono', monospace; font-size:0.8rem; margin:3px 0; }
+.html-attack-box { background:#2d1117; border:1px solid #f8514966; border-left:4px solid #f85149; border-radius:8px; padding:0.7rem 1rem; color:#f85149; margin:4px 0; font-family:'JetBrains Mono', monospace; font-size:0.82rem; }
+.html-attack-title { color:#f85149; font-family:'JetBrains Mono', monospace; font-size:0.78rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:0.4rem; }
+.html-clean-box { background:#0d2b1a; border:1px solid #23863666; border-left:4px solid #2ea043; border-radius:8px; padding:0.7rem 1rem; color:#3fb950; margin:4px 0; font-family:'JetBrains Mono', monospace; font-size:0.82rem; }
+.pii-box { background:#2b1f0a; border:1px solid #e3b34166; border-left:4px solid #e3b341; border-radius:8px; padding:0.7rem 1rem; color:#e3b341; margin:4px 0; font-family:'JetBrains Mono', monospace; font-size:0.82rem; }
+.pii-title { color:#e3b341; font-family:'JetBrains Mono', monospace; font-size:0.78rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:0.4rem; }
+.pii-clean-box { background:#0d2b1a; border:1px solid #23863666; border-left:4px solid #2ea043; border-radius:8px; padding:0.7rem 1rem; color:#3fb950; margin:4px 0; font-family:'JetBrains Mono', monospace; font-size:0.82rem; }
+.pii-item { background:#2b1a00; border-left:3px solid #e3b341; padding:4px 10px; border-radius:0 4px 4px 0; color:#e3b341; font-family:'JetBrains Mono', monospace; font-size:0.8rem; margin:3px 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -190,6 +197,77 @@ def render_guardrail_result(q_result, original_question: str) -> None:
         st.markdown(f'<div class="q-box" style="border-color:#1f6feb">{safe(q_result.sanitized_question)}</div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="q-box" style="border-color:#f85149">Blocked — nothing sent to retrieval/LLM</div>', unsafe_allow_html=True)
+
+    # ── HTML Attack Warning Block ─────────────────────────────────────────────
+    html_attacks_detected = any(
+        "html" in item.lower() or "script" in item.lower()
+        for item in q_result.filter_log
+    )
+
+    if html_attacks_detected:
+        st.markdown(
+            '<div class="html-attack-title">⚠️ HTML / Script Attack Detected & Removed</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="html-attack-box">🔴 HTML/script attack content was found in your question and removed before processing.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="html-clean-box">✓ HTML attack content stripped — clean question passed forward</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="html-clean-box">✓ No HTML / script attack content detected</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── PII Masking Warning Block ────────────────────────────────────────────
+    pii_log_items = [item for item in q_result.filter_log if "pii masked" in item.lower()]
+
+    if pii_log_items:
+        st.markdown(
+            '<div class="pii-title">🟡 Personal Information (PII) Detected & Masked</div>',
+            unsafe_allow_html=True,
+        )
+        # Map each masked PII type to a friendly label and token
+        pii_labels = {
+            "email address"      : ("📧", "Email address",       "[EMAIL]"),
+            "phone number (lk)"  : ("📞", "Phone number (LK)",   "[PHONE]"),
+            "phone number"       : ("📞", "Phone number",        "[PHONE]"),
+            "nic number"         : ("🪪", "NIC number",          "[NIC]"),
+            "credit card number" : ("💳", "Credit card number",  "[CARD]"),
+            "passport number"    : ("🛂", "Passport number",     "[PASSPORT]"),
+            "bank account number": ("🏦", "Bank account number", "[BANK_ACCOUNT]"),
+            "address/location detail": ("📍", "Address/location", "[ADDRESS]"),
+        }
+        for log_item in pii_log_items:
+            # Extract the masked types from the log entry
+            # log entry format: "PII masked: email address, phone number"
+            after_colon = log_item.split(":", 1)[-1].strip().lower()
+            detected_types = [t.strip() for t in after_colon.split(",")]
+            for pii_type in detected_types:
+                if pii_type in pii_labels:
+                    icon, label, token = pii_labels[pii_type]
+                    st.markdown(
+                        f'<div class="pii-item">{icon} {label} detected → replaced with <b>{token}</b></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="pii-item">⚠️ {safe(pii_type)} detected → masked</div>',
+                        unsafe_allow_html=True,
+                    )
+        st.markdown(
+            '<div class="pii-clean-box">✓ PII masked in question — safe version sent to retrieval and LLM</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="pii-clean-box">✓ No personal information (PII) detected</div>',
+            unsafe_allow_html=True,
+        )
 
     if q_result.filter_log:
         st.markdown("**Filters applied:**")

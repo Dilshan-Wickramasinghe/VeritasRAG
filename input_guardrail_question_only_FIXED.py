@@ -44,6 +44,91 @@ Design notes
 - Some quality issues only warn unless strict_mode=True.
 - Sanitization never rewrites meaning and never auto-corrects spelling.
 - The output keeps the original and sanitized question separately.
+
+─────────────────────────────────────────────────────────────────────────────
+ADDED — HTML Attack Prevention  (_sanitize_html_attacks)
+─────────────────────────────────────────────────────────────────────────────
+ADDED — PII Masking  (mask_pii  +  modified _q_privacy  +  modified check_question)
+─────────────────────────────────────────────────────────────────────────────
+
+What was added:
+    mask_pii(text) — new function that replaces PII with safe tokens.
+    _q_privacy()   — modified to call mask_pii() instead of just detecting.
+    check_question() — modified to apply masking before all checks run.
+
+Why it was added:
+    Previously PII detection only BLOCKED or WARNED the user.
+    A question like "what is the refund policy for john@gmail.com"
+    was blocked entirely — which is too aggressive.
+    Now PII is MASKED so the question still passes and gets answered safely.
+
+What gets masked:
+    Email addresses     → [EMAIL]
+    Phone numbers       → [PHONE]
+    Sri Lankan NIC      → [NIC]
+    Credit card numbers → [CARD]
+    Passport numbers    → [PASSPORT]
+    Bank account refs   → [BANK_ACCOUNT]
+    Address details     → [ADDRESS]
+
+Example:
+    Input  : "what is the policy for john@gmail.com and 0771234567"
+    Output : "what is the policy for [EMAIL] and [PHONE]"
+    Result : question PASSES with a warning shown to user
+─────────────────────────────────────────────────────────────────────────────
+
+What was added:
+    A new function _sanitize_html_attacks(text) that runs as the FIRST step
+    inside sanitize() before all other checks.
+
+Why it was added:
+    Attackers can hide malicious code using HTML encoding tricks that bypass
+    the existing security checks. For example:
+        Normal attack  : <script>alert(1)</script>       caught by existing checks
+        Encoded attack : &lt;script&gt;alert(1)&lt;/script&gt;  bypasses existing checks
+    Decoding and stripping HTML attacks FIRST ensures all later checks
+    see the real content.
+
+What it handles:
+    Step 1  — Double/triple HTML entity decoding  e.g. &amp;lt;script&amp;gt;
+    Step 2  — Percent encoding decoding           e.g. %3Cscript%3E
+    Step 3  — Script tag removal                  e.g. <script>alert(1)</script>
+    Step 4  — iframe tag removal                  e.g. <iframe src="malicious.com">
+    Step 5  — Event handler removal               e.g. onload= onclick= onerror=
+    Step 6  — JavaScript URL removal              e.g. javascript:alert(1)
+    Step 7  — Style/CSS tag removal               e.g. <style>body{...}</style>
+    Step 8  — Meta redirect removal               e.g. <meta http-equiv="refresh">
+    Step 9  — Form tag removal                    e.g. <form action="malicious.com">
+    Step 10 — All remaining HTML tag removal
+    Step 11 — CSS expression attack removal       e.g. expression(alert(1))
+    Step 12 — Collapse extra spaces after cleanup
+
+Where it is located:
+    Defined just above the sanitize() function.
+    Called as the very first line inside sanitize().
+
+─────────────────────────────────────────────────────────────────────────────
+FIX — Corrected order of PII masking and HTML attack cleaner
+─────────────────────────────────────────────────────────────────────────────
+
+Problem:
+    HTML attack cleaner was running BEFORE PII masking.
+    Email addresses contain @ which the noisy symbol remover flagged
+    as a suspicious character — causing a false HTML attack warning.
+
+    Example:
+        Input : "what is the policy for john@gmail.com"
+        Wrong : HTML cleaner sees @ → flags as attack → false warning
+        Fixed : PII masker runs first → [EMAIL] → HTML cleaner sees no @
+
+Fix:
+    Inside sanitize(), the order is now:
+        Step 1 — mask_pii()            replaces john@gmail.com → [EMAIL]
+        Step 2 — _sanitize_html_attacks()  now sees [EMAIL], no @ to flag
+        Step 3 — rest of sanitization continues normally
+
+    Also removed duplicate PII masking call from check_question()
+    since it now runs correctly inside sanitize() as Step 1.
 """
 
 from __future__ import annotations
@@ -412,6 +497,76 @@ def _contains_mixed_script_homoglyphs(text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HTML ATTACK PREVENTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sanitize_html_attacks(text: str) -> str:
+    """
+    Decodes and removes all HTML-based attack vectors before any other checks.
+
+    Handles:
+    - Double/triple HTML entity encoding  e.g. &amp;lt;script&amp;gt;
+    - Percent encoding                    e.g. %3Cscript%3E
+    - Script tag injection                e.g. <script>alert(1)</script>
+    - iframe injection                    e.g. <iframe src="malicious.com">
+    - Event handler injection             e.g. onload= onclick= onerror=
+    - JavaScript URL injection            e.g. javascript:alert(1)
+    - CSS injection                       e.g. <style>body{background:url(...)}</style>
+    - Meta redirect injection             e.g. <meta http-equiv="refresh">
+    - Form hijacking                      e.g. <form action="malicious.com">
+    - CSS expression attacks              e.g. expression(alert(1))
+    - Any remaining unknown HTML tags
+    """
+    import html as _html
+
+    # Step 1 — Decode HTML entities repeatedly (catches double/triple encoding)
+    while True:
+        decoded = _html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+
+    # Step 2 — Decode percent encoding repeatedly (catches %3Cscript%3E etc)
+    while True:
+        decoded = re.sub(r'%([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), text)
+        if decoded == text:
+            break
+        text = decoded
+
+    # Step 3 — Remove script tags and content inside
+    text = re.sub(r'<\s*script[\s\S]*?>[\s\S]*?<\s*/\s*script\s*>', '', text, flags=re.IGNORECASE)
+
+    # Step 4 — Remove iframe tags and content inside
+    text = re.sub(r'<\s*iframe[\s\S]*?>[\s\S]*?<\s*/\s*iframe\s*>', '', text, flags=re.IGNORECASE)
+
+    # Step 5 — Remove event handlers (onload=, onclick=, onerror=, onmouseover= etc)
+    text = re.sub(r'\bon\w+\s*=\s*["\']?[^"\'>\s]*["\']?', '', text, flags=re.IGNORECASE)
+
+    # Step 6 — Remove javascript: URLs
+    text = re.sub(r'javascript\s*:', '', text, flags=re.IGNORECASE)
+
+    # Step 7 — Remove style tags and content inside
+    text = re.sub(r'<\s*style[\s\S]*?>[\s\S]*?<\s*/\s*style\s*>', '', text, flags=re.IGNORECASE)
+
+    # Step 8 — Remove meta tags
+    text = re.sub(r'<\s*meta[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # Step 9 — Remove form tags
+    text = re.sub(r'<\s*form[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # Step 10 — Remove all remaining HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # Step 11 — Remove CSS expression attacks
+    text = re.sub(r'expression\s*\(', '', text, flags=re.IGNORECASE)
+
+    # Step 12 — Collapse extra spaces left after removals
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SANITIZER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -419,9 +574,32 @@ def sanitize(text: str) -> Tuple[str, List[str]]:
     """
     Cleans the question text and returns (sanitized_text, change_log).
     Never changes word meaning and never auto-corrects spelling.
+
+    Order of operations (important):
+        1. PII masking FIRST  — replaces emails/phones with [EMAIL]/[PHONE] etc
+                                so @ and digits are gone before HTML cleaner runs
+        2. HTML attack cleaner — now sees [EMAIL] not raw @ symbol, no false trigger
+        3. Rest of sanitization — unicode, whitespace, punctuation cleanup
     """
     log: List[str] = []
     text = "" if text is None else str(text)
+
+    # ── Step 1: PII masking — runs FIRST before HTML attack cleaner ──────────
+    # IMPORTANT: Must run before HTML cleaner because email addresses contain @
+    # which the noisy symbol remover would flag as suspicious.
+    # Masking first converts john@gmail.com → [EMAIL] so @ is gone before
+    # the HTML cleaner and noisy symbol remover run.
+    pii_masked, pii_found = mask_pii(text)
+    if pii_found:
+        log.append(f"PII masked: {', '.join(pii_found)}")
+    text = pii_masked
+
+    # ── Step 2: HTML attack prevention — runs AFTER PII masking ──────────────
+    # Now safe to run because emails/phones are already replaced with tokens.
+    html_cleaned = _sanitize_html_attacks(text)
+    if html_cleaned != text:
+        log.append("Removed HTML/script attack content")
+    text = html_cleaned
 
     normalized = unicodedata.normalize("NFKC", text)
     if normalized != text:
@@ -720,23 +898,112 @@ def _q_safety(text: str) -> List[CheckResult]:
     return checks
 
 
-def _q_privacy(text: str) -> CheckResult:
-    found = []
-    if P.EMAIL.search(text): found.append("email address")
-    if P.PHONE_LK.search(text) or P.PHONE_INTL.search(text): found.append("phone number")
-    if P.NIC_LK.search(text): found.append("NIC number")
-    if P.CREDIT_CARD.search(text): found.append("credit card number")
-    if P.PASSPORT.search(text): found.append("passport number")
-    if P.BANK_ACCOUNT_LIKE.search(text): found.append("bank account number")
-    if P.ADDRESS_LIKE.search(text): found.append("address/location detail")
+def mask_pii(text: str) -> tuple:
+    """
+    ADDED — PII Masking
+    -------------------
+    Instead of just detecting and blocking/warning PII,
+    this function REPLACES detected PII with safe placeholder tokens.
 
-    if found:
+    This allows the question to PASS and still be answered,
+    without exposing real personal data to the LLM or retrieval system.
+
+    Masks:
+        - Email addresses     → [EMAIL]
+        - Phone numbers       → [PHONE]
+        - Sri Lankan NIC      → [NIC]
+        - Credit card numbers → [CARD]
+        - Passport numbers    → [PASSPORT]
+        - Bank account refs   → [BANK_ACCOUNT]
+        - Address details     → [ADDRESS]
+
+    Returns:
+        (masked_text, list_of_what_was_masked)
+
+    Example:
+        Input  : "what is the refund policy for john@gmail.com"
+        Output : "what is the refund policy for [EMAIL]"
+                 masked = ["email address"]
+    """
+    masked = []
+
+    # Mask email addresses — replace with [EMAIL]
+    if P.EMAIL.search(text):
+        text = P.EMAIL.sub("[EMAIL]", text)
+        masked.append("email address")
+
+    # Mask Sri Lankan phone numbers — replace with [PHONE]
+    if P.PHONE_LK.search(text):
+        text = P.PHONE_LK.sub("[PHONE]", text)
+        masked.append("phone number (LK)")
+
+    # Mask international phone numbers — replace with [PHONE]
+    if P.PHONE_INTL.search(text):
+        text = P.PHONE_INTL.sub("[PHONE]", text)
+        if "phone number (LK)" not in masked:
+            masked.append("phone number")
+
+    # Mask Sri Lankan NIC numbers — replace with [NIC]
+    if P.NIC_LK.search(text):
+        text = P.NIC_LK.sub("[NIC]", text)
+        masked.append("NIC number")
+
+    # Mask credit card numbers — replace with [CARD]
+    if P.CREDIT_CARD.search(text):
+        text = P.CREDIT_CARD.sub("[CARD]", text)
+        masked.append("credit card number")
+
+    # Mask passport numbers — replace with [PASSPORT]
+    if P.PASSPORT.search(text):
+        text = P.PASSPORT.sub("[PASSPORT]", text)
+        masked.append("passport number")
+
+    # Mask bank account references — replace with [BANK_ACCOUNT]
+    if P.BANK_ACCOUNT_LIKE.search(text):
+        text = P.BANK_ACCOUNT_LIKE.sub("[BANK_ACCOUNT]", text)
+        masked.append("bank account number")
+
+    # Mask address/location details — replace with [ADDRESS]
+    if P.ADDRESS_LIKE.search(text):
+        text = P.ADDRESS_LIKE.sub("[ADDRESS]", text)
+        masked.append("address/location detail")
+
+    return text, masked
+
+
+def _q_privacy(text: str) -> CheckResult:
+    """
+    MODIFIED — PII Masking (was: PII Detection only)
+    -------------------------------------------------
+    Previously this function only DETECTED PII and returned a warning/block.
+    Now it calls mask_pii() which REPLACES PII with safe tokens first.
+
+    Change:
+        Before : detected PII → blocked question or warned user
+        After  : detected PII → masked in text → question still passes
+                 user is warned that PII was masked, not blocked
+
+    Why:
+        Blocking users just because their question contained an email or
+        phone number is too aggressive. Masking lets the question through
+        safely while still protecting personal data from reaching the LLM.
+    """
+    # Mask PII in the text and get list of what was masked
+    masked_text, masked_items = mask_pii(text)
+
+    if masked_items:
+        # PII was found and masked — warn the user but still pass
         return CheckResult(
-            "pii_detected",
-            True,
-            warning=True,
-            message=f"Question contains personal information ({', '.join(found)}). Avoid including unnecessary personal data.",
+            "pii_masked",                          # check name changed from pii_detected
+            True,                                  # passed = True (not blocked)
+            warning=True,                          # warn user about masking
+            message=(
+                f"Personal information detected and masked: {', '.join(masked_items)}. "
+                f"Your question was modified to remove personal data before processing."
+            ),
         )
+
+    # No PII found — clean pass
     return CheckResult("privacy", True)
 
 
@@ -916,12 +1183,16 @@ class InputGuardrail:
         original = "" if question is None else str(question)
         sanitized, filter_log = sanitize(original)
 
+        # NOTE — PII masking now runs inside sanitize() as Step 1,
+        # before the HTML attack cleaner. No need to mask again here.
+        # filter_log already contains PII masking entries from sanitize().
+
         checks: List[CheckResult] = [
             _q_empty(original),
             _q_nonprintable(original),
             _q_unicode_abuse(original),
             _q_homoglyph(original),
-            _q_leetspeak_obfuscation(original),
+            _q_leetspeak_obfuscation(original), 
             _q_length(sanitized),
             _q_repeated_chars(sanitized),
             _q_real_words(sanitized),
@@ -933,6 +1204,7 @@ class InputGuardrail:
 
         checks.extend(_q_security(sanitized, original))
         checks.extend(_q_safety(_normalized_for_attack_checks(original)))
+        # MODIFIED — _q_privacy now warns about masking instead of blocking
         checks.append(_q_privacy(sanitized))
 
         if self.non_eng_ok:
