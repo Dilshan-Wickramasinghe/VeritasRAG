@@ -299,6 +299,15 @@ class P:
         r"(?:[A-Za-z]+\s+){1,5}(?:road|rd|street|st|lane|mawatha|avenue|ave)\b",
         re.IGNORECASE,
     )
+    DANGEROUS_URL_SCHEME = re.compile(r"\b(?:javascript|data|vbscript|file)\s*:\s*[^\s<>'\"]+", re.IGNORECASE)
+    URL_WITH_SCHEME = re.compile(r"\b(?:https?|ftp)://[^\s<>'\"\])}]+", re.IGNORECASE)
+    WWW_URL = re.compile(r"\bwww\.[^\s<>'\"\])}]+", re.IGNORECASE)
+    BARE_DOMAIN_URL = re.compile(
+        r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+"
+        r"(?:com|org|net|edu|gov|lk|io|ai|co|info|biz|me|dev|app)"
+        r"(?:/[^\s<>'\"\])}]*)?",
+        re.IGNORECASE,
+    )
 
     ENGLISH = re.compile(
         r"\b(the|is|are|was|were|what|how|why|when|where|who|which|does|do|did|"
@@ -566,6 +575,34 @@ def _sanitize_html_attacks(text: str) -> str:
     return text
 
 
+def _sanitize_urls(text: str) -> Tuple[str, List[str]]:
+    """
+    Replaces URLs with a safe [URL] token before retrieval/LLM processing.
+
+    Handles normal links (https://, http://, ftp://, www.example.com),
+    bare domains (example.com/path), and unsafe URL schemes such as
+    javascript:, data:, vbscript:, and file:.
+    """
+    found: List[str] = []
+
+    def replace_url(label: str):
+        def _replace(match: re.Match) -> str:
+            if label not in found:
+                found.append(label)
+            value = match.group(0)
+            trimmed = value.rstrip(".,!?;:")
+            suffix = value[len(trimmed):]
+            return "[URL]" + suffix
+        return _replace
+
+    text = P.DANGEROUS_URL_SCHEME.sub(replace_url("unsafe URL scheme"), text)
+    text = P.URL_WITH_SCHEME.sub(replace_url("URL"), text)
+    text = P.WWW_URL.sub(replace_url("URL"), text)
+    text = P.BARE_DOMAIN_URL.sub(replace_url("bare domain URL"), text)
+
+    return text, found
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SANITIZER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,8 +631,14 @@ def sanitize(text: str) -> Tuple[str, List[str]]:
         log.append(f"PII masked: {', '.join(pii_found)}")
     text = pii_masked
 
-    # ── Step 2: HTML attack prevention — runs AFTER PII masking ──────────────
-    # Now safe to run because emails/phones are already replaced with tokens.
+    # Step 2: URL handling - mask links before retrieval/LLM usage.
+    url_cleaned, urls_found = _sanitize_urls(text)
+    if urls_found:
+        log.append(f"URL sanitized: {', '.join(urls_found)}")
+    text = url_cleaned
+
+    # Step 3: HTML attack prevention - runs after PII and URL masking.
+    # Now safe to run because emails, phones, and URLs are already replaced.
     html_cleaned = _sanitize_html_attacks(text)
     if html_cleaned != text:
         log.append("Removed HTML/script attack content")
