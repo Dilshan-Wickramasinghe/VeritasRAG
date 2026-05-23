@@ -300,12 +300,19 @@ class P:
         re.IGNORECASE,
     )
     DANGEROUS_URL_SCHEME = re.compile(r"\b(?:javascript|data|vbscript|file)\s*:\s*[^\s<>'\"]+", re.IGNORECASE)
-    URL_WITH_SCHEME = re.compile(r"\b(?:https?|ftp)://[^\s<>'\"\])}]+", re.IGNORECASE)
-    WWW_URL = re.compile(r"\bwww\.[^\s<>'\"\])}]+", re.IGNORECASE)
-    BARE_DOMAIN_URL = re.compile(
-        r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+"
-        r"(?:com|org|net|edu|gov|lk|io|ai|co|info|biz|me|dev|app)"
-        r"(?:/[^\s<>'\"\])}]*)?",
+    URL = re.compile(
+        r"(?<!@)\b("
+        r"(?:(?:https?|ftp)://|www\.)"
+        r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+"
+        r"[A-Za-z]{2,24}"
+        r"|"
+        r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+"
+        r"(?:com|org|net|edu|gov|lk|io|ai|co|info|biz|me|dev|app|cloud|site|online|tech)"
+        r")"
+        r"(?::\d{2,5})?"
+        r"(?:/[^\s<>'\"\])}]*)?"
+        r"(?:\?[^\s<>'\"\])}]*)?"
+        r"(?:#[^\s<>'\"\])}]*)?",
         re.IGNORECASE,
     )
 
@@ -596,9 +603,7 @@ def _sanitize_urls(text: str) -> Tuple[str, List[str]]:
         return _replace
 
     text = P.DANGEROUS_URL_SCHEME.sub(replace_url("unsafe URL scheme"), text)
-    text = P.URL_WITH_SCHEME.sub(replace_url("URL"), text)
-    text = P.WWW_URL.sub(replace_url("URL"), text)
-    text = P.BARE_DOMAIN_URL.sub(replace_url("bare domain URL"), text)
+    text = P.URL.sub(replace_url("URL"), text)
 
     return text, found
 
@@ -773,6 +778,29 @@ def _q_length(text: str) -> CheckResult:
     if words > Config.QUESTION_MAX_WORDS:
         return CheckResult("too_long", False, True, message=f"Question has too many words ({words}, max {Config.QUESTION_MAX_WORDS}).")
     return CheckResult("length", True)
+
+
+def _q_url(original: str, sanitized: str) -> CheckResult:
+    """
+    Checks if the question contains any URLs (standalone or embedded) and blocks them.
+    """
+    if P.URL.search(original) or P.DANGEROUS_URL_SCHEME.search(original):
+        # Determine if it's standalone or embedded
+        if sanitized.strip() == "[URL]":
+            return CheckResult(
+                "url_only",
+                False,
+                True,
+                message="Input contains only a URL. Please ask a question in words; URLs are not allowed.",
+            )
+        else:
+            return CheckResult(
+                "url_embedded",
+                False,
+                True,
+                message="Input contains an embedded URL. URLs are not allowed in questions.",
+            )
+    return CheckResult("url", True)
 
 
 def _q_repeated_chars(text: str) -> CheckResult:
@@ -1236,6 +1264,7 @@ class InputGuardrail:
             _q_unicode_abuse(original),
             _q_homoglyph(original),
             _q_leetspeak_obfuscation(original), 
+            _q_url(original, sanitized),
             _q_length(sanitized),
             _q_repeated_chars(sanitized),
             _q_real_words(sanitized),
