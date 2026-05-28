@@ -584,28 +584,100 @@ def _sanitize_html_attacks(text: str) -> str:
 
 def _sanitize_urls(text: str) -> Tuple[str, List[str]]:
     """
-    Replaces URLs with a safe [URL] token before retrieval/LLM processing.
+    Identifies and neutralizes URLs in the input.
+    - Normal URLs are replaced with [URL].
+    - Dangerous URLs (unsafe schemes, internal/loopback IPs/SSRF, prompt injection payloads)
+      are replaced with [NEUTRALIZED_DANGEROUS_URL].
 
-    Handles normal links (https://, http://, ftp://, www.example.com),
-    bare domains (example.com/path), and unsafe URL schemes such as
-    javascript:, data:, vbscript:, and file:.
+    Returns:
+        (sanitized_text, list_of_url_types_found)
     """
     found: List[str] = []
 
-    def replace_url(label: str):
-        def _replace(match: re.Match) -> str:
-            if label not in found:
-                found.append(label)
-            value = match.group(0)
-            trimmed = value.rstrip(".,!?;:")
-            suffix = value[len(trimmed):]
-            return "[URL]" + suffix
-        return _replace
+    # Unsafe schemes pattern:
+    unsafe_scheme_pat = re.compile(r"^(?:javascript|data|vbscript|file|jar|ftp)\s*:", re.IGNORECASE)
 
-    text = P.DANGEROUS_URL_SCHEME.sub(replace_url("unsafe URL scheme"), text)
-    text = P.URL.sub(replace_url("URL"), text)
+    # SSRF / Internal IP pattern:
+    internal_ip_pat = re.compile(
+        r"\b(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3}|"
+        r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
+        r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[?::1\]?)\b",
+        re.IGNORECASE
+    )
+
+    # SSRF URL full match pattern (detects standalone/protocol-prefixed internal hosts):
+    local_ssrf_url_pat = re.compile(
+        r"\b("
+        r"(?:(?:https?|ftp)://|www\.)?"
+        r"(?:"
+        r"localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3}|"
+        r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
+        r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[?::1\]?"
+        r")"
+        r"(?::\d{2,5})?"
+        r"(?:/[^\s<>'\"\])}]*)?"
+        r"(?:\?[^\s<>'\"\])}]*)?"
+        r"(?:#[^\s<>'\"\])}]*)?"
+        r")",
+        re.IGNORECASE
+    )
+
+    # Prompt injection keywords pattern in the URL:
+    prompt_inj_pat = re.compile(
+        r"\b(?:ignore|disregard|forget|system\s*prompt|override|jailbreak|bypass|instruction|developer)\b",
+        re.IGNORECASE
+    )
+
+    def process_url(url_val: str) -> Tuple[str, str]:
+        # Classify the URL
+        if unsafe_scheme_pat.search(url_val):
+            return "[NEUTRALIZED_DANGEROUS_URL]", "unsafe URL scheme"
+        if internal_ip_pat.search(url_val) or local_ssrf_url_pat.search(url_val):
+            return "[NEUTRALIZED_DANGEROUS_URL]", "internal IP/SSRF"
+        if prompt_inj_pat.search(url_val):
+            return "[NEUTRALIZED_DANGEROUS_URL]", "prompt injection attempt"
+
+        return "[URL]", "URL"
+
+    # We will do replacement using a callback on all patterns.
+    # Let's handle DANGEROUS_URL_SCHEME first
+    def replace_dangerous_scheme(match: re.Match) -> str:
+        value = match.group(0)
+        trimmed = value.rstrip(".,!?;:")
+        suffix = value[len(trimmed):]
+        token, label = process_url(trimmed)
+        if label not in found:
+            found.append(label)
+        return token + suffix
+
+    text = P.DANGEROUS_URL_SCHEME.sub(replace_dangerous_scheme, text)
+
+    # Next, handle LOCAL_SSRF_URL to ensure local IPs/hosts are neutralized first
+    def replace_local_ssrf_url(match: re.Match) -> str:
+        value = match.group(0)
+        trimmed = value.rstrip(".,!?;:")
+        suffix = value[len(trimmed):]
+        token, label = process_url(trimmed)
+        if label not in found:
+            found.append(label)
+        return token + suffix
+
+    text = local_ssrf_url_pat.sub(replace_local_ssrf_url, text)
+
+    # Finally, handle standard public URLs
+    def replace_normal_url(match: re.Match) -> str:
+        value = match.group(0)
+        trimmed = value.rstrip(".,!?;:")
+        suffix = value[len(trimmed):]
+        token, label = process_url(trimmed)
+        if label not in found:
+            found.append(label)
+        return token + suffix
+
+    text = P.URL.sub(replace_normal_url, text)
 
     return text, found
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -782,25 +854,51 @@ def _q_length(text: str) -> CheckResult:
 
 def _q_url(original: str, sanitized: str) -> CheckResult:
     """
-    Checks if the question contains any URLs (standalone or embedded) and blocks them.
+    Checks if the question contains any URLs and applies the appropriate policy:
+    1. Standalone URLs (whether normal or dangerous) are blocked.
+    2. Embedded dangerous URLs (e.g. unsafe scheme, internal IP, or prompt injection payload) are blocked.
+    3. Embedded normal URLs are allowed to pass but warned about.
     """
-    if P.URL.search(original) or P.DANGEROUS_URL_SCHEME.search(original):
-        # Determine if it's standalone or embedded
-        if sanitized.strip() == "[URL]":
+    # Check if the sanitized question contains any of the placeholders
+    has_normal_url = "[URL]" in sanitized
+    has_dangerous_url = "[NEUTRALIZED_DANGEROUS_URL]" in sanitized
+
+    if has_normal_url or has_dangerous_url:
+        # Check if the input is ONLY a URL (no substantial other question content)
+        # We strip the placeholders to see if any real words remain.
+        stripped = sanitized.replace("[URL]", "").replace("[NEUTRALIZED_DANGEROUS_URL]", "").strip()
+        
+        # If no real letters/numbers remain, it's a standalone URL
+        is_standalone = not any(c.isalnum() for c in stripped)
+
+        if is_standalone:
             return CheckResult(
                 "url_only",
                 False,
                 True,
                 message="Input contains only a URL. Please ask a question in words; URLs are not allowed.",
             )
-        else:
+        
+        # If it's embedded, check if there are dangerous URLs
+        if has_dangerous_url:
             return CheckResult(
-                "url_embedded",
+                "url_dangerous",
                 False,
                 True,
-                message="Input contains an embedded URL. URLs are not allowed in questions.",
+                message="Input contains a dangerous URL (e.g. unsafe scheme, internal IP/SSRF, or prompt injection).",
             )
+        
+        # If it's embedded normal URLs, allow to pass with warning
+        if has_normal_url:
+            return CheckResult(
+                "url_sanitized",
+                True,
+                warning=True,
+                message="An embedded URL was detected in your question and sanitized to [URL] for safety.",
+            )
+
     return CheckResult("url", True)
+
 
 
 def _q_repeated_chars(text: str) -> CheckResult:
@@ -1163,11 +1261,13 @@ def _q_semantic_intent(text: str) -> List[CheckResult]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HIGH_RISK = {
+    "url_dangerous",
     "script_injection", "template_injection", "path_traversal", "null_byte_injection",
     "prompt_injection", "jailbreak", "harmful_intent", "self_harm", "child_safety",
     "extremism", "hate_speech", "homoglyph_attack", "leetspeak_obfuscation", "social_engineering",
 }
 _MEDIUM_RISK = {
+    "url_only",
     "profanity", "pii_detected", "non_english", "too_long", "out_of_scope",
     "roleplay_or_pretend", "unrelated_opinion_prediction", "gibberish",
 }
