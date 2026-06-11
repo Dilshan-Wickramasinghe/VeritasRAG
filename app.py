@@ -25,7 +25,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("**Security Status:**")
-    st.info("✅ Context-aware security enabled\n- Blocks malicious queries\n- Allows legitimate security docs")
+    st.info("Context-aware security enabled\n- Blocks malicious queries\n- Allows legitimate security docs")
 
 # Main content
 col1, col2 = st.columns(2)
@@ -64,7 +64,7 @@ if check_button:
     elif not api_key.strip():
         st.error("❌ Please provide a Groq API key")
     else:
-        with st.spinner("🔄 Analyzing faithfulness..."):
+        with st.spinner("Analyzing faithfulness...."):
             try:
                 result = check_faithfulness(
                     answer=answer,
@@ -76,8 +76,6 @@ if check_button:
                     top_k=top_k,
                 )
                 
-                # Display results
-                st.success("✅ Analysis Complete!")
                 
                 # Verdict section
                 col1, col2, col3 = st.columns(3)
@@ -96,7 +94,7 @@ if check_button:
                     st.metric("Is Grounded", "✅ Yes" if result.is_grounded else "❌ No")
                 
                 # Grounded claims
-                st.subheader("✅ Grounded Claims")
+                st.subheader("Grounded Claims")
                 if result.grounded_claims:
                     for i, claim in enumerate(result.grounded_claims, 1):
                         st.success(f"{i}. {claim}")
@@ -105,12 +103,12 @@ if check_button:
                 
                 # Hallucinated claims
                 if result.hallucinated_claims:
-                    st.subheader("⚠️ Out-of-Context Claims (Removed)")
+                    st.subheader("Out-of-Context Claims (Removed)")
                     for i, claim in enumerate(result.hallucinated_claims, 1):
                         st.warning(f"{i}. {claim}")
                 
                 # Final answer
-                st.subheader("📝 Final Answer (Cleaned)")
+                st.subheader("Final Answer (Cleaned)")
                 st.info(result.final_answer)
                 
                 # Retrieved context
@@ -126,7 +124,7 @@ if check_button:
 st.markdown("---")
 st.markdown("""
 **RAG Faithfulness Checker v2.1.0**
-- 🔐 Context-aware security with hacking keyword detection
-- 📊 Three-stage verification (self-report, cosine similarity, LLM tiebreaker)
-- 🚫 Blocks malicious queries outside security documentation context
+- Context-aware security with hacking keyword detection
+- Three-stage verification (self-report, cosine similarity, LLM tiebreaker)
+- Blocks malicious queries outside security documentation context
 """)

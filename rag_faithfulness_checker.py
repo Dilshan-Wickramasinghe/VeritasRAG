@@ -27,9 +27,7 @@ import os
 import re
 import json
 import time
-import html
 import logging
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,15 +39,17 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 
 load_dotenv()
 
-# Configure security logger
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY AUDIT LOGGER
+# ─────────────────────────────────────────────────────────────────────────────
+
 SECURITY_LOG = logging.getLogger("rag_security_audit")
 if not SECURITY_LOG.handlers:
-    handler = logging.FileHandler("security_incidents.log")
-    formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
+    _handler = logging.FileHandler("security_incidents.log")
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     )
-    handler.setFormatter(formatter)
-    SECURITY_LOG.addHandler(handler)
+    SECURITY_LOG.addHandler(_handler)
     SECURITY_LOG.setLevel(logging.WARNING)
 
 
@@ -63,61 +63,18 @@ DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_TOP_K         = 5
 SIMILARITY_THRESHOLD  = 0.60   # cosine score >= this → grounded immediately
 BORDERLINE_LOW        = 0.40   # cosine score <  this → out of context immediately
-GROUNDING_THRESHOLD   = 0.35   # Semantic similarity threshold for document grounding
+GROUNDING_THRESHOLD   = 0.35   # min cosine similarity for question↔document
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECURITY CONFIG
+# CONTEXT-AWARE SECURITY CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MAX_INPUT_LENGTH = 5000
-
-RATE_LIMIT_WINDOW = 60
-MAX_REQUESTS_PER_WINDOW = 20
-
-TEMP_BLOCK_TIME = 300
-
-REQUEST_LOG = {}
-BLOCKED_USERS = {}
-
-# Prompt injection patterns (always blocked)
-PROMPT_INJECTION_PATTERNS = [
-    r"ignore previous instructions",
-    r"reveal.*system prompt",
-    r"show.*system prompt",
-    r"<script.*?>",
-    r"javascript:",
-]
-
-# Hacking-related keywords (contextual blocking)
-MALICIOUS_INTENT_KEYWORDS = [
-    r"sql injection",
-    r"cross.?site scripting",
-    r"xss attack",
-    r"buffer overflow",
-    r"privilege escalation",
-    r"brute force",
-    r"denial of service",
-    r"ddos",
-    r"ransomware",
-    r"keylogger",
-    r"backdoor",
-    r"exploit",
-    r"zero.?day",
-    r"malware",
-    r"phishing",
-    r"payload",
-    r"shellcode",
-    r"reverse shell",
-    r"remote code execution",
-    r"rce",
-    r"code injection",
-    r"path traversal",
-    r"directory traversal",
-]
-
-# Security/legitimate keywords
-SECURITY_CONTEXT_KEYWORDS = [
+# Keywords that indicate the source document is a legitimate cybersecurity
+# resource (e.g. a penetration-testing guide, CVE report, OWASP document).
+# At least SECURITY_DOC_MIN_HITS must be present in the document for it to
+# be treated as a valid security resource.
+SECURITY_DOC_KEYWORDS = [
     "security",
     "vulnerability",
     "penetration testing",
@@ -132,6 +89,36 @@ SECURITY_CONTEXT_KEYWORDS = [
     "cwe",
     "cvss",
 ]
+SECURITY_DOC_MIN_HITS = 3   # how many of the above must appear in the document
+
+# Patterns that flag a question or answer as hacking-related.
+# These are checked against the question AND the answer.
+HACKING_PATTERNS = [
+    r"sql\s+injection",
+    r"cross.?site\s+scripting",
+    r"xss\s+attack",
+    r"buffer\s+overflow",
+    r"privilege\s+escalation",
+    r"brute\s+force",
+    r"denial\s+of\s+service",
+    r"\bddos\b",
+    r"\bransomware\b",
+    r"\bkeylogger\b",
+    r"\bbackdoor\b",
+    r"\bexploit\b",
+    r"zero.?day",
+    r"\bmalware\b",
+    r"\bphishing\b",
+    r"\bpayload\b",
+    r"\bshellcode\b",
+    r"reverse\s+shell",
+    r"remote\s+code\s+execution",
+    r"\brce\b",
+    r"code\s+injection",
+    r"path\s+traversal",
+    r"directory\s+traversal",
+]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHRASES THE LLM USES TO SELF-REPORT MISSING INFORMATION
@@ -277,141 +264,137 @@ RULES:
 
 Answer:"""
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECURITY HELPERS
+# CONTEXT-AWARE SECURITY HELPERS  (new — used only inside check_faithfulness)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _sanitize_input(text: str) -> str:
-
-    if not isinstance(text, str):
-        raise ValueError("Input must be a string.")
-
-    # Remove dangerous script/style tags
-    text = re.sub(
-        r"</?(script|style).*?>",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Remove javascript URLs
-    text = re.sub(
-        r"javascript:",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text)
-
-    text = text.strip()
-
-    # Escape remaining HTML special chars
-    text = html.escape(text)
-
-    if len(text) > MAX_INPUT_LENGTH:
-        raise ValueError(
-            f"Input exceeds {MAX_INPUT_LENGTH} characters."
-        )
-
+def _has_hacking_content(text: str) -> bool:
+    """
+    Return True if *text* matches any hacking-related pattern.
+    Checked against both the user question and the LLM answer.
+    """
     lower = text.lower()
-
-    for pattern in PROMPT_INJECTION_PATTERNS:
-
-        if re.search(pattern, lower):
-            raise ValueError(
-                "Unsafe input detected: prompt injection attempt."
-            )
-
-    return text
+    return any(re.search(p, lower) for p in HACKING_PATTERNS)
 
 
-def _check_rate_limit(user_id: str):
-
-    now = time.time()
-
-    if user_id in BLOCKED_USERS:
-
-        if now < BLOCKED_USERS[user_id]:
-
-            raise ValueError(
-                "User temporarily blocked due to abuse."
-            )
-
-        del BLOCKED_USERS[user_id]
-
-    if user_id not in REQUEST_LOG:
-        REQUEST_LOG[user_id] = []
-
-    REQUEST_LOG[user_id] = [
-        t for t in REQUEST_LOG[user_id]
-        if now - t < RATE_LIMIT_WINDOW
-    ]
-
-    REQUEST_LOG[user_id].append(now)
-
-    if len(REQUEST_LOG[user_id]) > MAX_REQUESTS_PER_WINDOW:
-
-        BLOCKED_USERS[user_id] = now + TEMP_BLOCK_TIME
-
-        raise ValueError(
-            "Rate limit exceeded. Try again later."
-        )
-
-
-def _is_security_document(text: str) -> bool:
+def _is_valid_security_document(source_text: str) -> bool:
     """
-    Check if the source document is legitimately about security topics.
-    Returns True if document mentions 3+ security-related keywords.
+    Return True when the uploaded document is a legitimate cybersecurity
+    resource — identified by the presence of at least SECURITY_DOC_MIN_HITS
+    security-domain keywords in its text.
+
+    A document that passes this test is considered a valid context for
+    discussing hacking-related topics (e.g. OWASP guide, CVE report,
+    penetration-testing manual).
     """
-    lower_text = text.lower()
-    count = sum(1 for keyword in SECURITY_CONTEXT_KEYWORDS if keyword in lower_text)
-    return count >= 3
+    lower = source_text.lower()
+    hits  = sum(1 for kw in SECURITY_DOC_KEYWORDS if kw in lower)
+    return hits >= SECURITY_DOC_MIN_HITS
 
 
-def _is_question_grounded_in_doc(
-    question: str,
+def _is_question_grounded_in_document(
+    question:    str,
     source_text: str,
-    embeddings: HuggingFaceEmbeddings
+    embeddings:  HuggingFaceEmbeddings,
 ) -> bool:
     """
-    Check if question semantically relates to the source document.
-    Uses cosine similarity of embeddings for more accurate matching.
+    Return True when the user's question is semantically related to the
+    source document (cosine similarity > GROUNDING_THRESHOLD).
+
+    This prevents an attacker from uploading an unrelated document and then
+    asking hacking questions that have nothing to do with it.
+
+    Falls back to keyword-overlap if the embedding call fails.
     """
     try:
-        question_vec = embeddings.embed_query(question)
-        doc_vec = embeddings.embed_query(source_text)
-        similarity = _cosine(question_vec, doc_vec)
-        return similarity > GROUNDING_THRESHOLD
+        q_vec   = embeddings.embed_query(question)
+        doc_vec = embeddings.embed_query(source_text[:3000])   # first 3 k chars
+        return _cosine(q_vec, doc_vec) > GROUNDING_THRESHOLD
     except Exception:
-        # Fallback to keyword overlap if embedding fails
-        question_words = set(question.lower().split())
-        doc_words = set(source_text.lower().split())
-        overlap = len(question_words & doc_words) / len(question_words) if question_words else 0
-        return overlap > 0.3
+        # Keyword-overlap fallback
+        q_words  = set(question.lower().split())
+        d_words  = set(source_text.lower().split())
+        overlap  = len(q_words & d_words) / max(len(q_words), 1)
+        return overlap > 0.30
 
 
-def _has_malicious_intent(text: str) -> bool:
-    """Check if text contains hacking/malicious keywords."""
-    lower_text = text.lower()
-    return any(
-        re.search(pattern, lower_text)
-        for pattern in MALICIOUS_INTENT_KEYWORDS
+def _run_context_aware_security_check(
+    question:    str,
+    answer:      str,
+    source_text: str,
+    embeddings:  HuggingFaceEmbeddings,
+    user_id:     str,
+) -> None:
+    """
+    Context-aware security gate — called once before faithfulness checking.
+
+    Decision logic
+    ──────────────
+    1.  If neither the question nor the answer contains hacking-related
+        keywords  →  nothing to do, return immediately.
+
+    2.  If hacking keywords ARE present, allow the call to proceed ONLY when
+        BOTH of the following are true:
+          a. The source document is a valid cybersecurity resource
+             (_is_valid_security_document returns True).
+          b. The user's question is semantically grounded in that document
+             (_is_question_grounded_in_document returns True).
+
+    3.  If either condition fails, log a security incident and raise
+        ValueError to block the call.
+
+    Parameters
+    ──────────
+    question    : effective question (or answer used as fallback)
+    answer      : LLM-generated answer being checked
+    source_text : full document text
+    embeddings  : already-initialised HuggingFaceEmbeddings instance
+    user_id     : identifier for audit logging
+    """
+
+    # Step 1 — quick exit if no hacking content detected
+    if not (_has_hacking_content(question) or _has_hacking_content(answer)):
+        return
+
+    # Step 2 — hacking content found; evaluate legitimacy
+    is_security_doc    = _is_valid_security_document(source_text)
+    is_grounded_in_doc = _is_question_grounded_in_document(
+        question, source_text, embeddings
     )
 
+    if is_security_doc and is_grounded_in_doc:
+        # Legitimate security discussion — log for audit and allow
+        SECURITY_LOG.info(
+            "SECURITY_DISCUSSION_ALLOWED | user=%s | "
+            "is_security_doc=True | is_grounded=True | "
+            "question_preview=%r",
+            user_id, question[:120],
+        )
+        return
 
-def _log_security_incident(user_id: str, incident_type: str, details: dict):
-    """Log security incidents for admin review."""
-    incident_msg = (
-        f"User: {user_id} | Type: {incident_type} | "
-        f"Details: {json.dumps(details)}"
+    # Step 3 — block and log
+    SECURITY_LOG.warning(
+        "MALICIOUS_HACKING_QUERY_BLOCKED | user=%s | "
+        "is_security_doc=%s | is_grounded=%s | "
+        "question_preview=%r",
+        user_id,
+        is_security_doc,
+        is_grounded_in_doc,
+        question[:120],
     )
-    SECURITY_LOG.warning(incident_msg)
+    raise ValueError(
+        "Security policy violation: hacking-related content detected outside "
+        "a legitimate cybersecurity document context.\n"
+        "This request has been blocked and logged.\n\n"
+        "To discuss security topics, upload a valid cybersecurity resource "
+        "(e.g. an OWASP guide, CVE report, or penetration-testing manual) "
+        "and ensure your question is grounded in that document."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTERNAL HELPERS
+# INTERNAL HELPERS  (unchanged from v1)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _cosine(a: list, b: list) -> float:
@@ -502,7 +485,7 @@ def check_faithfulness(
     source_text:   str,
     api_key:       str = "",
     question:      str = "",
-    user_id:       str = "anonymous",
+    user_id:       str = "anonymous",   # NEW — used for security audit logging
     model:         str = DEFAULT_MODEL,
     chunk_size:    int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
@@ -528,7 +511,7 @@ def check_faithfulness(
         If omitted, the answer itself is used as a fallback.
 
     user_id : str, optional
-        User identifier for rate limiting and security audit logging.
+        User identifier used exclusively for security audit logging.
         Default: "anonymous".
 
     model : str, optional
@@ -560,11 +543,34 @@ def check_faithfulness(
     ------
     ValueError
         If api_key is missing, source_text is empty, answer is empty,
-        or security policy violations detected.
+        or a security policy violation is detected (hacking-related content
+        outside a valid cybersecurity document context).
+
+    Security behaviour
+    ------------------
+    This function includes a context-aware security check that runs after
+    the embeddings model is initialised but before faithfulness verification.
+
+    The check works in three steps:
+
+      1. Scan the question and answer for hacking-related keywords/patterns.
+         If none are found, the check passes immediately with no overhead.
+
+      2. If hacking content is detected, the source document is examined:
+           - _is_valid_security_document()  — requires 3+ security keywords
+             (e.g. "owasp", "vulnerability", "penetration testing") to be
+             present in the document.
+           - _is_question_grounded_in_document()  — requires the question's
+             embedding to be semantically close (cosine > 0.35) to the
+             document, preventing unrelated documents being used as cover.
+
+      3. If BOTH conditions pass  →  legitimate security discussion, allowed.
+         If EITHER condition fails →  incident logged to security_incidents.log
+                                      and ValueError raised to block the call.
 
     Examples
     --------
-    Basic usage:
+    Basic usage (unchanged):
 
         from rag_faithfulness_checker import check_faithfulness
 
@@ -580,7 +586,7 @@ def check_faithfulness(
         print(result.grounded_ratio)   # 1.0
         print(result.final_answer)     # cleaned answer
 
-    Chatbot integration:
+    Chatbot integration (unchanged):
 
         result = check_faithfulness(
             answer      = chatbot_response,
@@ -596,18 +602,29 @@ def check_faithfulness(
                 f"Note: {len(result.hallucinated_claims)} claim(s) "
                 "could not be verified against the source document."
             )
+
+    Security-sensitive usage:
+
+        # This will be BLOCKED — hacking keywords present, document is not a
+        # recognised cybersecurity resource.
+        result = check_faithfulness(
+            answer      = "SQL injection exploits parameterized query flaws.",
+            source_text = open("annual_report.txt").read(),   # not a security doc
+            question    = "How does SQL injection work?",
+            user_id     = "user_42",
+        )
+        # → raises ValueError("Security policy violation ...")
+
+        # This will be ALLOWED — document is an OWASP guide, question is
+        # semantically grounded in it.
+        result = check_faithfulness(
+            answer      = "SQL injection exploits unsanitised user input.",
+            source_text = open("owasp_top10.txt").read(),    # valid security doc
+            question    = "How does SQL injection work?",
+            user_id     = "researcher_01",
+        )
+        # → proceeds normally, returns FaithfulnessResult
     """
-
-    
-    # ── Security checks ──────────────────────────────────────────────────────────
-    _check_rate_limit(user_id)
-
-    answer = _sanitize_input(answer)
-
-    source_text = _sanitize_input(source_text)
-
-    if question:
-        question = _sanitize_input(question)
 
     # ── Validate inputs ───────────────────────────────────────────────────────
     key = api_key or os.getenv("GROQ_API_KEY", "")
@@ -630,29 +647,17 @@ def check_faithfulness(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # CONTEXT-AWARE SECURITY CHECK (NEW)
-    # ────────────────────────────────────────────────────────────────────────────
-    is_security_doc = _is_security_document(source_text)
-    has_hacking_keywords = _has_malicious_intent(answer) or _has_malicious_intent(effective_question)
-
-    if has_hacking_keywords:
-        # Check if this is legitimate security research in a security document
-        if is_security_doc and _is_question_grounded_in_doc(effective_question, source_text, embeddings):
-            # Legitimate security document review — proceed
-            pass
-        else:
-            # Suspicious external hacking query — log and block
-            _log_security_incident(user_id, "MALICIOUS_HACKING_QUERY", {
-                "is_security_doc": is_security_doc,
-                "is_grounded": _is_question_grounded_in_doc(effective_question, source_text, embeddings),
-                "question": effective_question[:100],  # Log first 100 chars
-                "timestamp": time.time(),
-            })
-            raise ValueError(
-                "Security policy violation: Hacking-related queries outside "
-                "legitimate security documentation context are not permitted."
-            )
+    # ── Context-aware security check (NEW) ───────────────────────────────────
+    # Placed here so embeddings are ready for semantic similarity.
+    # Raises ValueError and logs if a hacking query is detected outside
+    # a valid cybersecurity document context.
+    _run_context_aware_security_check(
+        question    = effective_question,
+        answer      = answer,
+        source_text = source_text,
+        embeddings  = embeddings,
+        user_id     = user_id,
+    )
 
     # ── Build FAISS index from source document ────────────────────────────────
     splitter = RecursiveCharacterTextSplitter(
@@ -707,9 +712,6 @@ def check_faithfulness(
         final_answer = answer        # nothing was removed — return as-is
     else:
         final_answer = _rebuild(groq_client, model, effective_question, grounded)
-
-    # Output Sanitization
-    final_answer = html.escape(final_answer)    
 
     # ── Return structured result ──────────────────────────────────────────────
     return FaithfulnessResult(
